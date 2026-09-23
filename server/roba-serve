@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""roba-serve: the only thing the roba backup key may run on the lab server.
+
+It is installed as the forced command of one SSH key in ~/.ssh/authorized_keys:
+
+    command="<home>/backups/.roba/roba-serve",restrict ssh-ed25519 AAAA... roba@<machine>
+
+So a machine that holds only the roba key can do exactly four things, and nothing else:
+
+  git-receive-pack '<root>/git/<name>.git'   push to a backup repository. A missing repository is
+                                            created. Every repository refuses to delete a ref and
+                                            refuses a non-fast-forward push, so a push can add
+                                            history but never remove it.
+  git-upload-pack  '<root>/git/<name>.git'   read a backup repository, for status and for a restore.
+  rsync --server ...                        through rrsync -no-del, confined to <root>/data: files
+                                            can be added, but --delete and --remove-source-files
+                                            are refused.
+  roba-list                                 list what is backed up, as JSON.
+
+Anything else is refused with a sentence on stderr and exit 1. The key cannot open a shell.
+This is a railing against accidents on the machine that pushes, not a wall against the server's
+own owner: the person's normal login can still change anything here.
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+ROOT = os.path.join(HOME, "backups")
+GIT = os.path.join(ROOT, "git")
+DATA = os.path.join(ROOT, "data")
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+GUARDS = (("receive.denyDeletes", "true"), ("receive.denyNonFastForwards", "true"), ("core.logAllRefUpdates", "true"))
+
+
+def refuse(sentence):
+    sys.stderr.write(f"roba-serve: {sentence}\n")
+    sys.exit(1)
+
+
+def repository_path(asked):
+    """Where a git path the client named really is, if it is a backup repository at all."""
+    path = asked
+    if path.startswith("~/"):
+        path = path[2:]
+    path = os.path.normpath(path if path.startswith("/") else os.path.join(HOME, path))
+    base = os.path.basename(path)
+    if os.path.dirname(path) != GIT or not base.endswith(".git") or not NAME.fullmatch(base[: -len(".git")]):
+        refuse(f"{asked!r} is not a roba backup repository; they live in {GIT}/<name>.git")
+    return path
+
+
+def guard(path):
+    for key, value in GUARDS:
+        subprocess.run(["git", "-C", path, "config", key, value], check=True)
+
+
+def serve_git(verb, asked):
+    path = repository_path(asked)
+    if not os.path.isdir(path):
+        if verb == "git-upload-pack":
+            refuse(f"there is no backup at {path} yet")
+        os.makedirs(GIT, exist_ok=True)
+        subprocess.run(["git", "init", "--bare", "--quiet", path], check=True)
+    guard(path)
+    os.execvp(verb, [verb, path])
+
+
+def listing():
+    out = {"root": ROOT, "git": [], "data": {}}
+    if os.path.isdir(GIT):
+        out["git"] = sorted(n[:-4] for n in os.listdir(GIT) if n.endswith(".git"))
+    if os.path.isdir(DATA):
+        for name in sorted(os.listdir(DATA)):
+            folder = os.path.join(DATA, name)
+            if os.path.isdir(folder):
+                out["data"][name] = sorted(os.listdir(folder))
+    print(json.dumps(out))
+
+
+def keep_private():
+    """The backups hold other people's data, so only this account may even list them.
+
+    A lab server often has many accounts, and a home folder on a lab NAS can be open to all of
+    them, even writable by all (mode 777). Mode 700 on the root closes everything below it, including
+    what rsync copies with the source's own modes.
+    """
+    os.makedirs(ROOT, mode=0o700, exist_ok=True)
+    os.chmod(ROOT, 0o700)
+
+
+def main():
+    keep_private()
+    command = os.environ.get("SSH_ORIGINAL_COMMAND", "")
+    if not command:
+        refuse("this key only runs roba commands; it cannot open a shell")
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        refuse("the command could not be read")
+    if parts[0] in ("git-receive-pack", "git-upload-pack") and len(parts) == 2:
+        serve_git(parts[0], parts[1])
+    if parts[0] == "rsync" and "--server" in parts:
+        os.makedirs(DATA, exist_ok=True)
+        os.execvp("rrsync", ["rrsync", "-no-del", DATA])
+    if parts == ["roba-list"]:
+        listing()
+        return
+    refuse(f"{parts[0]!r} is not a roba command")
+
+
+if __name__ == "__main__":
+    main()

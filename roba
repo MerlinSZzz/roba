@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+"""roba: back up your research to the lab server, and say so out loud.
+
+  roba init                 make the config, the list and a dedicated backup key
+  roba install-server       put the server half in place (once, with your normal login)
+  roba add <path> [opts]    add a folder to the list (git or data is guessed; see below)
+  roba git [name...]        push every branch and tag of the listed git repositories
+  roba data <path|name>     back up one data folder (a dataset, weights, a run) now
+  roba status               what is backed up, when, and what is not
+  roba remind               what the timer runs: push git, then remind loudly about data
+  roba install-timer        run `roba remind` every hour, with a desktop notification
+  roba hf <name>            upload a data entry to Hugging Face (only entries marked hf=...)
+
+The list is ~/.config/roba/backup.list, one entry per line, and anybody can edit it:
+
+  git   ~/PROJECTS/my-robot
+  data  ~/datasets/my_dataset       hf=you/my_dataset
+  data  ~/experiments/with-people   private        # people in it: lab server only, never Hugging Face
+
+Options after the path: name=<folder name on the server>, hf=<hub repo>, private.
+
+What protects the backups: roba pushes with its own key, and on the server that key runs only
+server/roba-serve. A git backup refuses to delete a branch and refuses a non-fast-forward push;
+data goes through rrsync -no-del. So a mistake on this machine can add to the backups but cannot
+remove them. When your history was rewritten, the new branch is kept beside the old one under
+refs/roba-diverged/<time>/<branch> rather than replacing it.
+
+Nothing is uploaded silently: every run that pushes or finds something undone says so with a
+desktop notification and a sound, and every run is written to ~/.local/state/roba/log.
+"""
+import argparse
+import configparser
+import datetime
+import json
+import os
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+CONF_DIR = os.path.join(HOME, ".config", "roba")
+CONFIG = os.path.join(CONF_DIR, "config")
+LIST = os.path.join(CONF_DIR, "backup.list")
+STATE_DIR = os.path.join(HOME, ".local", "state", "roba")
+STATE = os.path.join(STATE_DIR, "state.json")
+LOG = os.path.join(STATE_DIR, "log")
+SERVE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "server", "roba-serve")
+
+# What `roba init` writes as the server login. roba refuses to reach a server while the config still
+# says this, so nobody pushes to somebody else's account by running roba as shipped.
+PLACEHOLDER_HOST = "you@your-lab-server"
+
+DEFAULT_CONFIG = f"""[server]
+# who and where: your own login on the lab server; the path is relative to your home there
+host = {PLACEHOLDER_HOST}
+root = backups
+key = ~/.ssh/roba_ed25519
+
+[notify]
+desktop = yes
+sound = yes
+
+[git]
+# push: the timer pushes git by itself and tells you; remind: it only tells you
+auto = push
+
+[data]
+# remind about a data entry that changed since its last backup, or was never backed up
+remind = yes
+"""
+
+DEFAULT_LIST = """# roba backup list: one entry per line.  kind  path  [name=...] [hf=user/repo] [private]
+# git   ~/PROJECTS/some-repo
+# data  ~/datasets/some-dataset   hf=you/some-dataset
+# data  ~/experiments/with-people private
+"""
+
+
+class Entry:
+    def __init__(self, kind, path, options, line):
+        self.kind, self.path, self.options, self.line = kind, path, options, line
+        self.name = options.get("name") or os.path.basename(os.path.normpath(path))
+
+    @property
+    def private(self):
+        return "private" in self.options
+
+
+def say(text):
+    print(text)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')} {text}\n")
+
+
+def fail(text):
+    say(f"roba: {text}")
+    sys.exit(1)
+
+
+def server_host(cfg):
+    """The login roba reaches the server as, or a plain stop while the config still holds the placeholder."""
+    host = cfg["server"]["host"].strip()
+    if host == PLACEHOLDER_HOST:
+        fail(f"set [server] host in {CONFIG} to your own login first; it still says {PLACEHOLDER_HOST}")
+    return host
+
+
+def config():
+    parser = configparser.ConfigParser()
+    if not os.path.exists(CONFIG):
+        fail(f"there is no {CONFIG}; run `roba init` first")
+    parser.read(CONFIG)
+    return parser
+
+
+def entries():
+    out = []
+    if not os.path.exists(LIST):
+        return out
+    for number, raw in enumerate(open(LIST), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        words = shlex.split(line)
+        if words[0] not in ("git", "data") or len(words) < 2:
+            fail(f"{LIST} line {number} is not `git <path>` or `data <path>`: {raw.strip()}")
+        options = {}
+        for word in words[2:]:
+            key, _, value = word.partition("=")
+            options[key] = value or True
+        out.append(Entry(words[0], os.path.expanduser(words[1]), options, number))
+    names = [e.name for e in out]
+    for name in set(names):
+        if names.count(name) > 1:
+            fail(f"two entries in {LIST} have the name {name!r}; give one of them name=<other>")
+    return out
+
+
+def state():
+    try:
+        return json.load(open(STATE))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(data):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, STATE)
+
+
+def ssh_command(cfg):
+    key = os.path.expanduser(cfg["server"]["key"])
+    return ["ssh", "-i", key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+
+
+def notify(cfg, title, body, loud):
+    if cfg["notify"].getboolean("desktop", True) and shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "roba", "-u", "critical" if loud else "normal", title, body], check=False)
+    if cfg["notify"].getboolean("sound", True) and shutil.which("canberra-gtk-play"):
+        subprocess.run(["canberra-gtk-play", "-i", "dialog-warning" if loud else "complete"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def git_remote(cfg, entry):
+    return f"{server_host(cfg)}:{cfg['server']['root']}/git/{entry.name}.git"
+
+
+def run(cmd, env=None, cwd=None):
+    return subprocess.run(cmd, env=env, cwd=cwd, capture_output=True, text=True)
+
+
+def push_git(cfg, entry):
+    """Push every branch and tag. A rejected branch is kept under refs/roba-diverged/<time>/."""
+    if not os.path.isdir(os.path.join(entry.path, ".git")) and run(["git", "-C", entry.path, "rev-parse"]).returncode:
+        return {"name": entry.name, "ok": False, "said": f"{entry.path} is not a git repository"}
+    env = dict(os.environ, GIT_SSH_COMMAND=shlex.join(ssh_command(cfg)))
+    remote = git_remote(cfg, entry)
+    result = run(["git", "-C", entry.path, "push", "--porcelain", remote,
+                  "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*"], env=env)
+    pushed, rejected, already = [], [], []
+    for line in result.stdout.splitlines():
+        if "\t" not in line or line.startswith("To "):
+            continue
+        flag, refs = line[0], line.split("\t")[1]
+        src = refs.split(":")[0]
+        if flag == "!":
+            rejected.append(src)
+        elif flag in (" ", "+", "*", "-"):
+            pushed.append(src)
+        elif flag == "=":
+            already.append(src)
+    kept = []
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    for ref in rejected:
+        if ref.startswith("refs/heads/"):
+            branch = ref[len("refs/heads/"):]
+            again = run(["git", "-C", entry.path, "push", "--porcelain", remote,
+                         f"{ref}:refs/roba-diverged/{stamp}/{branch}"], env=env)
+            if again.returncode == 0:
+                kept.append(branch)
+    if result.returncode != 0 and not rejected:
+        return {"name": entry.name, "ok": False, "said": (result.stderr or result.stdout).strip()[-400:]}
+    new = [p for p in pushed if not p.startswith("refs/tags/")]
+    same = [p for p in already if not p.startswith("refs/tags/")]
+    said = f"{len(new)} branch(es) pushed, {len(same)} already on the server" if new else f"nothing new; all {len(same)} branch(es) already on the server"
+    if kept:
+        said += f"; {len(kept)} rewritten branch(es) kept as refs/roba-diverged/{stamp}/: {', '.join(kept)}"
+    others = [r for r in rejected if not r.startswith("refs/heads/")]
+    if others:
+        said += f"; refused: {', '.join(others)}"
+    return {"name": entry.name, "ok": not others, "said": said, "kept": kept, "pushed": len(new)}
+
+
+def unpushed(cfg, entry):
+    """How many commits on local branches the server does not have, read with git ls-remote."""
+    env = dict(os.environ, GIT_SSH_COMMAND=shlex.join(ssh_command(cfg)))
+    remote = run(["git", "-C", entry.path, "ls-remote", "--heads", git_remote(cfg, entry)], env=env)
+    if remote.returncode != 0:
+        return None
+    theirs = {line.split("\t")[1]: line.split("\t")[0] for line in remote.stdout.splitlines() if "\t" in line}
+    ours = run(["git", "-C", entry.path, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"]).stdout
+    total = 0
+    for line in ours.splitlines():
+        ref, sha = line.split()
+        base = theirs.get(ref)
+        if base == sha:
+            continue
+        span = f"{base}..{sha}" if base and run(["git", "-C", entry.path, "cat-file", "-e", base]).returncode == 0 else sha
+        count = run(["git", "-C", entry.path, "rev-list", "--count", span]).stdout.strip()
+        total += int(count or 0)
+    return total
+
+
+def newest_change(path, since):
+    """True as soon as one file under path changed after `since` (a timestamp)."""
+    for folder, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "__pycache__")]
+        for name in files:
+            try:
+                if os.lstat(os.path.join(folder, name)).st_mtime > since:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def backup_data(cfg, entry, st):
+    if not os.path.isdir(entry.path):
+        return {"name": entry.name, "ok": False, "said": f"{entry.path} is not a folder"}
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    previous = st.get("data", {}).get(entry.name, {}).get("snapshot")
+    cmd = ["rsync", "-a", "--partial", "--mkpath", "--info=stats1", "-e", shlex.join(ssh_command(cfg))]
+    if previous:
+        cmd.append(f"--link-dest=/{entry.name}/{previous}")
+    cmd += [entry.path.rstrip("/") + "/", f"{server_host(cfg)}:/{entry.name}/{stamp}/"]
+    result = run(cmd)
+    if result.returncode != 0:
+        return {"name": entry.name, "ok": False, "said": (result.stderr or result.stdout).strip()[-400:]}
+    st.setdefault("data", {})[entry.name] = {"snapshot": stamp, "at": datetime.datetime.now().timestamp(), "path": entry.path}
+    save_state(st)
+    return {"name": entry.name, "ok": True, "said": f"snapshot {stamp} on the server"}
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_init(args):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    for path, text in ((CONFIG, DEFAULT_CONFIG), (LIST, DEFAULT_LIST)):
+        if not os.path.exists(path):
+            with open(path, "w") as f:
+                f.write(text)
+            print(f"wrote {path}")
+        else:
+            print(f"kept {path}")
+    cfg = config()
+    key = os.path.expanduser(cfg["server"]["key"])
+    if not os.path.exists(key):
+        # ssh-keygen does not make the folder, and a new machine may have no ~/.ssh yet.
+        os.makedirs(os.path.dirname(key), mode=0o700, exist_ok=True)
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"roba@{socket.gethostname()}", "-f", key], check=True)
+        print(f"made the backup key {key}")
+    else:
+        print(f"kept the backup key {key}")
+    if cfg["server"]["host"].strip() == PLACEHOLDER_HOST:
+        print(f"next: set [server] host in {CONFIG} to your own login, then roba install-server (once), then roba add <path>")
+    else:
+        print("next: roba install-server (once), then roba add <path>")
+
+
+def cmd_install_server(args):
+    cfg = config()
+    host, root = server_host(cfg), cfg["server"]["root"]
+    pub = open(os.path.expanduser(cfg["server"]["key"]) + ".pub").read().strip()
+    serve = open(SERVE).read()
+    script = f"""set -e
+mkdir -p ~/{root}/git ~/{root}/data ~/{root}/.roba ~/.ssh
+cat > ~/{root}/.roba/roba-serve <<'ROBA_SERVE_EOF'
+{serve}ROBA_SERVE_EOF
+chmod 700 ~/{root}/.roba/roba-serve
+touch ~/.ssh/authorized_keys
+LINE='command="'"$HOME"'/{root}/.roba/roba-serve",restrict {pub}'
+if grep -qF '{pub.split()[1]}' ~/.ssh/authorized_keys; then echo "the roba key is already in authorized_keys"; else echo "$LINE" >> ~/.ssh/authorized_keys; echo "added the roba key, restricted to roba-serve"; fi
+chmod 600 ~/.ssh/authorized_keys 2>/dev/null || true
+ls -ld ~/.ssh ~/.ssh/authorized_keys
+"""
+    print(f"installing on {host} with your normal login (not the roba key)")
+    result = subprocess.run(["ssh", "-o", "BatchMode=yes", host, "bash -s"], input=script, text=True, capture_output=True)
+    print((result.stdout + result.stderr).strip())
+    if result.returncode:
+        sys.exit(1)
+    check = run(ssh_command(cfg) + [host, "roba-list"])
+    print("the roba key now answers:", check.stdout.strip() or check.stderr.strip())
+
+
+def cmd_add(args):
+    path = os.path.abspath(os.path.expanduser(args.path))
+    if not os.path.exists(path):
+        fail(f"{path} does not exist")
+    kind = args.kind or ("git" if os.path.exists(os.path.join(path, ".git")) else "data")
+    shown = path.replace(HOME, "~", 1) if path.startswith(HOME) else path
+    shown = shlex.quote(shown) if any(c.isspace() or c in "'\"#" for c in shown) else shown
+    line = f"{kind:5} {shown}" + "".join(f" {o}" for o in args.options)
+    for entry in entries():
+        if os.path.abspath(entry.path) == path:
+            print(f"already listed on line {entry.line}")
+            return
+    os.makedirs(CONF_DIR, exist_ok=True)
+    with open(LIST, "a") as f:
+        f.write(line + "\n")
+    say(f"roba: added `{line}` to {LIST}")
+
+
+def pick(kind, names):
+    chosen = [e for e in entries() if e.kind == kind and (not names or e.name in names)]
+    missing = set(names) - {e.name for e in chosen}
+    if missing:
+        fail(f"no {kind} entry named {', '.join(sorted(missing))} in {LIST}")
+    return chosen
+
+
+def cmd_git(args):
+    cfg = config()
+    results = [push_git(cfg, e) for e in pick("git", args.names)]
+    for r in results:
+        say(f"roba git {r['name']}: {'ok' if r['ok'] else 'FAILED'}: {r['said']}")
+    bad = [r for r in results if not r["ok"]]
+    notify(cfg, "roba: git backup" + (" FAILED" if bad else ""),
+           "\n".join(f"{r['name']}: {r['said']}" for r in results) or "no git entries", loud=bool(bad))
+    sys.exit(1 if bad else 0)
+
+
+def cmd_data(args):
+    cfg = config()
+    target = args.target
+    listed = [e for e in entries() if e.kind == "data" and (e.name == target or os.path.abspath(e.path) == os.path.abspath(os.path.expanduser(target)))]
+    if not listed:
+        cmd_add(argparse.Namespace(path=target, kind="data", options=args.options))
+        listed = [e for e in entries() if e.kind == "data" and os.path.abspath(e.path) == os.path.abspath(os.path.expanduser(target))]
+    st = state()
+    r = backup_data(cfg, listed[0], st)
+    say(f"roba data {r['name']}: {'ok' if r['ok'] else 'FAILED'}: {r['said']}")
+    notify(cfg, "roba: data backup" + ("" if r["ok"] else " FAILED"), f"{r['name']}: {r['said']}", loud=not r["ok"])
+    sys.exit(0 if r["ok"] else 1)
+
+
+def data_reminders(st):
+    out = []
+    for e in entries():
+        if e.kind != "data":
+            continue
+        done = st.get("data", {}).get(e.name)
+        if not os.path.isdir(e.path):
+            out.append(f"{e.name}: {e.path} is missing")
+        elif not done:
+            out.append(f"{e.name}: never backed up — run `roba data {e.name}`")
+        elif newest_change(e.path, done["at"]):
+            out.append(f"{e.name}: changed since {done['snapshot']} — run `roba data {e.name}`")
+    return out
+
+
+def cmd_status(args):
+    cfg = config()
+    st = state()
+    for e in entries():
+        if e.kind == "git":
+            n = unpushed(cfg, e)
+            print(f"git   {e.name:28} " + ("not on the server yet" if n is None else f"{n} commit(s) not on the server"))
+        else:
+            done = st.get("data", {}).get(e.name)
+            flags = " private" if e.private else ""
+            print(f"data  {e.name:28} " + (f"last snapshot {done['snapshot']}" if done else "never backed up") + flags)
+    for line in data_reminders(st):
+        print(f"  ! {line}")
+
+
+def cmd_remind(args):
+    cfg = config()
+    st = state()
+    lines, loud = [], False
+    if cfg["git"].get("auto", "push") == "push":
+        for e in pick("git", []):
+            r = push_git(cfg, e)
+            say(f"roba git {r['name']}: {'ok' if r['ok'] else 'FAILED'}: {r['said']}")
+            if not r["ok"] or r.get("pushed") or r.get("kept"):
+                lines.append(f"git {r['name']}: {r['said']}")
+            loud = loud or not r["ok"]
+    else:
+        for e in pick("git", []):
+            n = unpushed(cfg, e)
+            if n:
+                lines.append(f"git {e.name}: {n} commit(s) not on the server — run `roba git`")
+                loud = True
+    if cfg["data"].getboolean("remind", True):
+        todo = data_reminders(st)
+        lines += todo
+        loud = loud or bool(todo)
+    if lines:
+        notify(cfg, "roba: " + ("please look" if loud else "backed up"), "\n".join(lines[:12]), loud)
+    say("roba remind: " + ("; ".join(lines) if lines else "nothing to do"))
+
+
+def cmd_install_timer(args):
+    unit_dir = os.path.join(HOME, ".config", "systemd", "user")
+    os.makedirs(unit_dir, exist_ok=True)
+    me = os.path.realpath(__file__)
+    with open(os.path.join(unit_dir, "roba.service"), "w") as f:
+        f.write(f"[Unit]\nDescription=roba: push git backups and remind about data\n\n[Service]\nType=oneshot\nExecStart={sys.executable} {me} remind\n")
+    with open(os.path.join(unit_dir, "roba.timer"), "w") as f:
+        f.write("[Unit]\nDescription=roba every hour\n\n[Timer]\nOnCalendar=hourly\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "--now", "roba.timer"], check=True)
+    print("roba.timer is on: `systemctl --user list-timers roba.timer` shows the next run; "
+          "`systemctl --user disable --now roba.timer` turns it off")
+
+
+def cmd_hf(args):
+    matches = [e for e in entries() if e.kind == "data" and e.name == args.name]
+    if not matches:
+        fail(f"no data entry named {args.name}")
+    e = matches[0]
+    if e.private:
+        fail(f"{e.name} is marked private (people in it): it goes to the lab server only, never Hugging Face")
+    repo = e.options.get("hf")
+    if not repo or repo is True:
+        fail(f"{e.name} has no hf=<user/repo> on its line in {LIST}; add it to say where it goes")
+    cli = shutil.which("huggingface-cli") or shutil.which("hf")
+    if not cli:
+        fail("the Hugging Face command line is not installed (pip install -U huggingface_hub)")
+    say(f"roba hf {e.name}: uploading {e.path} to {repo}")
+    sys.exit(subprocess.run([cli, "upload", repo, e.path, ".", "--repo-type", "dataset"]).returncode)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="roba", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init").set_defaults(fn=cmd_init)
+    sub.add_parser("install-server").set_defaults(fn=cmd_install_server)
+    a = sub.add_parser("add")
+    a.add_argument("path")
+    a.add_argument("--kind", choices=["git", "data"])
+    a.add_argument("options", nargs="*", help="name=..., hf=user/repo, private")
+    a.set_defaults(fn=cmd_add)
+    g = sub.add_parser("git")
+    g.add_argument("names", nargs="*")
+    g.set_defaults(fn=cmd_git)
+    d = sub.add_parser("data")
+    d.add_argument("target")
+    d.add_argument("options", nargs="*")
+    d.set_defaults(fn=cmd_data)
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    sub.add_parser("remind").set_defaults(fn=cmd_remind)
+    sub.add_parser("install-timer").set_defaults(fn=cmd_install_timer)
+    h = sub.add_parser("hf")
+    h.add_argument("name")
+    h.set_defaults(fn=cmd_hf)
+    args, extra = p.parse_known_args()
+    if extra and args.cmd in ("add", "data"):
+        args.options = list(args.options) + extra
+    elif extra:
+        p.error(f"unrecognized arguments: {' '.join(extra)}")
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
