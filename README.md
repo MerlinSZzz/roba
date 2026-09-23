@@ -21,7 +21,7 @@ the recordings, and every commit that was never pushed.
 ## Use it
 
 ```bash
-./roba init                                   # config, list, and a dedicated key (~/.ssh/roba_ed25519)
+./roba init                                   # asks your server login; writes the config, the list and a key
 ./roba install-server                         # once, with your normal login: puts roba-serve on the server
 ./roba add ~/PROJECTS/my-repo                 # git is detected; anything else is data
 ./roba add ~/data/recordings private          # has people in it: lab server only, never Hugging Face
@@ -46,12 +46,19 @@ On the server everything lives under `~/backups`, which roba keeps at mode 700 s
 
 ## For other lab members
 
-Copy this folder, run `roba init`, and set `host` in `~/.config/roba/config` to your own login on
-the lab server: roba refuses to reach a server until you do. Then run `roba install-server` with
-that account, and add your folders. You do not have to install the timer: run
+Copy this folder and run `roba init`. It asks for your login on the lab server (user@address) and
+the folder there for the backups, and writes them into your own `~/.config/roba/config`; a script can
+pass `--host` and `--root` instead. With no answer it writes a placeholder, and roba refuses to reach
+a server until you put your own login there. Then run `roba install-server` with that account, and
+add your folders. You do not have to install the timer: run
 `roba git` and `roba data <path>` whenever you finish something.
 
 ## Tests
 
 `tests/test_serve.sh` proves the server-side promises without a server: it checks that the tool
 refuses what is not a roba command, refuses a deletion, refuses a rewrite, and keeps the old history.
+`tests/test_init.sh` proves what `roba init` writes: the login it is given or asked for, the
+placeholder when nobody answers, a refusal of anything that is not a login or a folder, and an
+existing config left alone.
+
+roba is released under the MIT licence; see LICENSE.

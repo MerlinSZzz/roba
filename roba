@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """roba: back up your research to the lab server, and say so out loud.
 
-  roba init                 make the config, the list and a dedicated backup key
+  roba init [--host user@address] [--root folder]
+                            make the config (it asks your login on the lab server), the list and a
+                            dedicated backup key
   roba install-server       put the server half in place (once, with your normal login)
   roba add <path> [opts]    add a folder to the list (git or data is guessed; see below)
   roba git [name...]        push every branch and tag of the listed git repositories
@@ -33,6 +35,7 @@ import configparser
 import datetime
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -52,10 +55,22 @@ SERVE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "server", "rob
 # says this, so nobody pushes to somebody else's account by running roba as shipped.
 PLACEHOLDER_HOST = "you@your-lab-server"
 
-DEFAULT_CONFIG = f"""[server]
+# A login is user@address, and a folder is a path under your home there. Both go into ssh arguments and
+# into the script install-server runs on the server, so nothing else is accepted: never an ssh option,
+# never a space, never a shell character, never a way out of your home.
+HOST_SHAPE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._-]*@[A-Za-z0-9._][A-Za-z0-9._-]*")
+ROOT_SHAPE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]*")
+
+
+def root_is_fine(root):
+    return bool(ROOT_SHAPE.fullmatch(root)) and ".." not in root.split("/")
+
+
+def config_text(host, root):
+    return f"""[server]
 # who and where: your own login on the lab server; the path is relative to your home there
-host = {PLACEHOLDER_HOST}
-root = backups
+host = {host}
+root = {root}
 key = ~/.ssh/roba_ed25519
 
 [notify]
@@ -70,6 +85,7 @@ auto = push
 # remind about a data entry that changed since its last backup, or was never backed up
 remind = yes
 """
+
 
 DEFAULT_LIST = """# roba backup list: one entry per line.  kind  path  [name=...] [hf=user/repo] [private]
 # git   ~/PROJECTS/some-repo
@@ -105,7 +121,17 @@ def server_host(cfg):
     host = cfg["server"]["host"].strip()
     if host == PLACEHOLDER_HOST:
         fail(f"set [server] host in {CONFIG} to your own login first; it still says {PLACEHOLDER_HOST}")
+    if not HOST_SHAPE.fullmatch(host):
+        fail(f"[server] host in {CONFIG} is not user@address; roba reaches no server with it")
     return host
+
+
+def server_root(cfg):
+    """The folder on the server the backups live in, under the login's home, or a plain stop."""
+    root = cfg["server"]["root"].strip()
+    if not root_is_fine(root):
+        fail(f"[server] root in {CONFIG} must be a folder under your home on the server, such as backups")
+    return root
 
 
 def config():
@@ -168,7 +194,7 @@ def notify(cfg, title, body, loud):
 
 
 def git_remote(cfg, entry):
-    return f"{server_host(cfg)}:{cfg['server']['root']}/git/{entry.name}.git"
+    return f"{server_host(cfg)}:{server_root(cfg)}/git/{entry.name}.git"
 
 
 def run(cmd, env=None, cwd=None):
@@ -269,15 +295,62 @@ def backup_data(cfg, entry, st):
 
 # ---------------------------------------------------------------- commands
 
+def ask(prompt):
+    """One answer typed at the terminal, or nothing when the terminal closes."""
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        print()
+        return ""
+
+
+def the_login(args):
+    """The server login and folder for a new config: --host and --root when given, else asked at a terminal.
+
+    With nobody to ask and no --host, it is the placeholder, which every command that reaches a server
+    refuses; so a config written by a script without --host cannot push anywhere by mistake.
+    """
+    host, root = args.host, args.root
+    asking = sys.stdin.isatty()
+    if host is None and asking:
+        while True:
+            host = ask("Your login on the lab server, as user@address (Enter to set it later): ") or None
+            if host is None or HOST_SHAPE.fullmatch(host):
+                break
+            print("That is not user@address.")
+    if host is not None and not HOST_SHAPE.fullmatch(host):
+        fail("--host takes your login on the lab server as user@address; nothing was written")
+    if root is None and asking and host is not None:
+        while True:
+            root = ask("The folder there for the backups, under your home [backups]: ") or "backups"
+            if root_is_fine(root):
+                break
+            print("That is not a folder under your home.")
+    root = "backups" if root is None else root
+    if not root_is_fine(root):
+        fail("--root takes a folder under your home on the server, such as backups; nothing was written")
+    return host or PLACEHOLDER_HOST, root
+
+
 def cmd_init(args):
-    os.makedirs(CONF_DIR, exist_ok=True)
-    for path, text in ((CONFIG, DEFAULT_CONFIG), (LIST, DEFAULT_LIST)):
-        if not os.path.exists(path):
-            with open(path, "w") as f:
-                f.write(text)
-            print(f"wrote {path}")
-        else:
-            print(f"kept {path}")
+    # AN EXISTING CONFIG IS NEVER OVERWRITTEN: it may hold a login that works.
+    if os.path.exists(CONFIG):
+        print(f"kept {CONFIG}")
+        if args.host is not None or args.root is not None:
+            print(f"roba: {CONFIG} is already there, so --host and --root were not written; change them there by hand")
+    else:
+        host, root = the_login(args)
+        os.makedirs(CONF_DIR, exist_ok=True)
+        with open(CONFIG, "w") as f:
+            f.write(config_text(host, root))
+        print(f"wrote {CONFIG}")
+    if not os.path.exists(LIST):
+        os.makedirs(CONF_DIR, exist_ok=True)
+        with open(LIST, "w") as f:
+            f.write(DEFAULT_LIST)
+        print(f"wrote {LIST}")
+    else:
+        print(f"kept {LIST}")
     cfg = config()
     key = os.path.expanduser(cfg["server"]["key"])
     if not os.path.exists(key):
@@ -295,7 +368,7 @@ def cmd_init(args):
 
 def cmd_install_server(args):
     cfg = config()
-    host, root = server_host(cfg), cfg["server"]["root"]
+    host, root = server_host(cfg), server_root(cfg)
     pub = open(os.path.expanduser(cfg["server"]["key"]) + ".pub").read().strip()
     serve = open(SERVE).read()
     script = f"""set -e
@@ -459,7 +532,10 @@ def cmd_hf(args):
 def main():
     p = argparse.ArgumentParser(prog="roba", description=__doc__.split("\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("init").set_defaults(fn=cmd_init)
+    i = sub.add_parser("init")
+    i.add_argument("--host", help="your login on the lab server, user@address; asked for when not given")
+    i.add_argument("--root", help="the folder there for the backups, under your home (default: backups)")
+    i.set_defaults(fn=cmd_init)
     sub.add_parser("install-server").set_defaults(fn=cmd_install_server)
     a = sub.add_parser("add")
     a.add_argument("path")
